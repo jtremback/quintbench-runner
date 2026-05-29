@@ -1,0 +1,18 @@
+[project]
+name = "quintbench-runner"
+version = "0.1.0"
+description = "Pier subclass that runs mini-swe-agent with the Quint-assisted-implementation skill, for the DeepSWE / Harbor benchmark."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "datacurve-pier",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quintbench_runner*"]
