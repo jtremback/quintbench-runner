@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "datacurve-pier",
+    # Pinned conservatively — verified end-to-end against 0.2.0 only.
+    # Loosen once a newer Pier passes a smoke run.
+    "datacurve-pier>=0.2,<0.3",
 ]
 
 [build-system]
