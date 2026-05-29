@@ -88,11 +88,17 @@ def _install_node_and_quint_script() -> str:
     """Install Node + npm + quint globally via whichever package manager is
     available. Mirrors the apt/apk/yum/dnf fan-out pattern from
     MiniSweAgent.install_spec() for portability across base images."""
+    # On Debian/Ubuntu images with NodeSource preconfigured (the case for the
+    # DeepSWE base images we've seen), `apt-get install -y nodejs` pulls
+    # NodeSource's nodejs which bundles npm. Trying to install Debian's npm
+    # package separately on top conflicts ("nodejs : Conflicts: npm"), so
+    # don't. We verify npm exists after; if it doesn't, the image isn't using
+    # NodeSource and the run fails loudly — fix in a follow-up iteration.
     return r"""
 set -euo pipefail
 
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get update && apt-get install -y nodejs npm
+  apt-get update && apt-get install -y nodejs
 elif command -v apk >/dev/null 2>&1; then
   apk add --no-cache nodejs npm
 elif command -v yum >/dev/null 2>&1; then
@@ -101,6 +107,11 @@ elif command -v dnf >/dev/null 2>&1; then
   dnf install -y nodejs npm
 else
   echo "ERROR: no known package manager (apt/apk/yum/dnf) to install Node" >&2
+  exit 1
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "ERROR: npm not on PATH after installing nodejs (image may lack NodeSource)" >&2
   exit 1
 fi
 
