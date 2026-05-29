@@ -22,8 +22,11 @@ Loaded via Pier's import-path mechanism (no fork of Pier required):
 
 from __future__ import annotations
 
+import base64
+import io
 import os
 import shlex
+import tarfile
 from pathlib import Path
 
 from pier.agents.installed.mini_swe_agent import MiniSweAgent
@@ -109,49 +112,38 @@ quint --version
 
 
 def _materialize_skill_files_script(skill_root: Path) -> str:
-    """Generate a shell script that creates ``SKILL_DEST`` and writes every
-    skill file into it via heredoc. Contents are embedded at agent-construction
-    time so the skill repo can stay private (no `git clone` inside the
-    sandbox), and so the skill version that runs matches this checkout
-    exactly."""
-    lines = [
-        "set -euo pipefail",
-        f"mkdir -p {shlex.quote(SKILL_DEST)}/guidelines/examples",
-    ]
+    """Generate a shell script that materializes the skill at ``SKILL_DEST``.
 
-    # Collect every file we need to ship.
-    files: list[tuple[str, Path]] = [("SKILL.md", skill_root / "SKILL.md")]
-    guidelines_dir = skill_root / "guidelines"
-    for md in sorted(guidelines_dir.glob("*.md")):
-        files.append((f"guidelines/{md.name}", md))
-    examples_dir = guidelines_dir / "examples"
-    if examples_dir.is_dir():
-        for qnt in sorted(examples_dir.glob("*.qnt")):
-            files.append((f"guidelines/examples/{qnt.name}", qnt))
+    Pier inlines each install step as a single ``RUN ["/bin/bash","-c","..."]``
+    line in the Dockerfile, and BuildKit caps Dockerfile lines at 64 KB. A
+    naive heredoc-per-file approach hit that ceiling (the skill is ~140 KB
+    raw). Instead we tar+gzip the skill on the host, base64-encode the blob,
+    and have the sandbox decode-and-extract it in one shot. ~140 KB raw
+    compresses to ~30 KB gzipped and ~40 KB base64 — well under 64 KB.
+    """
+    # Build a tar.gz of the skill in memory. Members are stored with paths
+    # relative to SKILL_DEST so we can extract straight into it.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        skill_md = skill_root / "SKILL.md"
+        tar.add(skill_md, arcname="SKILL.md")
+        guidelines_dir = skill_root / "guidelines"
+        for md in sorted(guidelines_dir.glob("*.md")):
+            tar.add(md, arcname=f"guidelines/{md.name}")
+        examples_dir = guidelines_dir / "examples"
+        if examples_dir.is_dir():
+            for qnt in sorted(examples_dir.glob("*.qnt")):
+                tar.add(qnt, arcname=f"guidelines/examples/{qnt.name}")
 
-    for idx, (rel_dest, src) in enumerate(files):
-        dest_path = f"{SKILL_DEST}/{rel_dest}"
-        content = src.read_text(encoding="utf-8")
-
-        # Pick a heredoc marker that can't collide with file content.
-        marker = f"QUINT_SKILL_EOF_{idx:03d}"
-        while marker in content:
-            marker += "_X"
-
-        lines.append(
-            # Single-quoted heredoc => no shell expansion of the body.
-            f"cat > {shlex.quote(dest_path)} <<'{marker}'\n"
-            f"{content}\n"
-            f"{marker}"
-        )
-
-    # Final sanity check.
-    lines.append(
-        f"test -f {shlex.quote(SKILL_DEST)}/SKILL.md "
-        f"&& test -d {shlex.quote(SKILL_DEST)}/guidelines "
-        "|| (echo 'ERROR: skill materialization failed' >&2; exit 1)"
+    blob_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    dest_q = shlex.quote(SKILL_DEST)
+    return (
+        "set -euo pipefail\n"
+        f"mkdir -p {dest_q}\n"
+        f'echo "{blob_b64}" | base64 -d | tar -xzf - -C {dest_q}\n'
+        f"test -f {dest_q}/SKILL.md && test -d {dest_q}/guidelines "
+        "|| (echo 'ERROR: skill materialization failed' >&2; exit 1)\n"
     )
-    return "\n".join(lines)
 
 
 # Extra domains needed during the install phase, beyond the LLM-provider ones
