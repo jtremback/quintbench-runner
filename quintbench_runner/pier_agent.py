@@ -122,6 +122,40 @@ quint --version
 """.strip()
 
 
+def _warm_quint_evaluator_script() -> str:
+    """Pre-download quint's Rust evaluator during install.
+
+    `quint run` lazily fetches a Rust evaluator from api.github.com on first
+    use and caches it at ``$HOME/.quint/rust-evaluator-<ver>/``. The benchmark
+    sandbox is air-gapped at task time (only the LLM-provider domains are
+    allowlisted), so that first fetch fails with `EAI_AGAIN api.github.com` and
+    every `quint run` (the whole simulation/checking half of the skill) dies.
+
+    Warm the cache here, during the install phase, where build network is open.
+    Run as the *agent* user so it lands in the same HOME the agent uses at task
+    time (quint is on the global PATH from `npm install -g`, so the agent user
+    can invoke it). The evaluator is arch-specific, so warming in-container
+    fetches the right binary.
+    """
+    return r"""
+set -euo pipefail
+WARMDIR="$(mktemp -d)"
+cat > "$WARMDIR/warm.qnt" <<'QNT'
+module warm {
+  var x: int
+  action init = { x' = 0 }
+  action step = { x' = x + 1 }
+  val inv = x >= 0
+}
+QNT
+# First `quint run` triggers the evaluator download + cache.
+quint run "$WARMDIR/warm.qnt" --invariant=inv --max-steps=1 --max-samples=1
+# Fail loud if the evaluator did not actually cache.
+ls -d "$HOME"/.quint/rust-evaluator-* >/dev/null
+echo "quint evaluator warmed in $HOME/.quint"
+""".strip()
+
+
 def _materialize_skill_files_script(skill_root: Path) -> str:
     """Generate a shell script that materializes the skill at ``SKILL_DEST``.
 
@@ -295,6 +329,13 @@ class QuintMiniSweAgent(MiniSweAgent):
                     user="root",
                     env=None,
                     run=_materialize_skill_files_script(self._skill_root),
+                ),
+                # Warm quint's Rust evaluator as the agent user (its HOME is the
+                # one used at task time) while build network is still open.
+                InstallStep(
+                    user="agent",
+                    env=None,
+                    run=_warm_quint_evaluator_script(),
                 ),
             ],
             verification_command=base.verification_command,
