@@ -167,6 +167,22 @@ _QUINT_INSTALL_DOMAINS: tuple[str, ...] = (
 )
 
 
+# AWS variables to forward into the sandbox for Bedrock models. SSO / temporary
+# credentials need the secret + session token in addition to the access key.
+_BEDROCK_CRED_VARS: tuple[str, ...] = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION_NAME",
+)
+
+
+def _is_bedrock_model(model_name: str | None) -> bool:
+    return bool(model_name) and model_name.startswith("bedrock/")
+
+
 # ---------------------------------------------------------------------------
 # The agent.
 # ---------------------------------------------------------------------------
@@ -175,12 +191,15 @@ _QUINT_INSTALL_DOMAINS: tuple[str, ...] = (
 class QuintMiniSweAgent(MiniSweAgent):
     """mini-swe-agent + the Quint-assisted-implementation skill.
 
-    Behaves identically to the upstream `MiniSweAgent` except for three things:
+    Behaves identically to the upstream `MiniSweAgent` except for four things:
       1. the install phase adds Node + `quint` and writes the skill files
          into ``/opt/quint-skill/`` inside the sandbox;
       2. the task instruction is prepended with SKILL.md so the agent sees
          the skill from turn 1 without needing a separate prompt template;
-      3. the network allowlist is extended for npm during install.
+      3. the network allowlist is extended for npm during install;
+      4. for Bedrock models, the full AWS SSO credential set is forwarded into
+         the sandbox (upstream only forwards AWS_ACCESS_KEY_ID, which is
+         insufficient for temporary/SSO credentials).
     """
 
     def __init__(
@@ -193,6 +212,47 @@ class QuintMiniSweAgent(MiniSweAgent):
         # Resolve at construction time, not at module import. Pier may load
         # this module before the skill is available (e.g. CLI inspection).
         self._skill_root = _resolve_skill_path(skill_path)
+        if _is_bedrock_model(self.model_name):
+            self._forward_bedrock_credentials()
+
+    # ---- bedrock credentials ----------------------------------------------
+
+    def _forward_bedrock_credentials(self) -> None:
+        """Pull AWS credentials from the host env into ``_extra_env`` so they
+        reach the sandbox.
+
+        mini-swe-agent's run() only auto-forwards ``AWS_ACCESS_KEY_ID`` for
+        bedrock (Pier's ``PROVIDER_KEYS["bedrock"]``), but SSO / temporary
+        credentials also require ``AWS_SECRET_ACCESS_KEY`` and
+        ``AWS_SESSION_TOKEN``. Everything in ``_extra_env`` is merged into the
+        sandbox env and is visible to the parent's API-key check, so adding the
+        full set here is sufficient. Explicit ``--agent-env`` values win.
+        """
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        for var in _BEDROCK_CRED_VARS:
+            if var in self._extra_env:
+                continue  # explicit --agent-env wins
+            val = os.environ.get(var)
+            # litellm/boto each look for different region aliases; backfill
+            # them from whatever region we do have.
+            if val is None and var in ("AWS_DEFAULT_REGION", "AWS_REGION_NAME"):
+                val = region
+            if val:
+                self._extra_env[var] = val
+
+        missing = [
+            v
+            for v in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+            if v not in self._extra_env
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Bedrock model {self.model_name!r} selected but {missing} "
+                "not found in the environment. Export your SSO credentials "
+                "first, e.g.:\n"
+                '  eval "$(aws configure export-credentials '
+                '--profile bedrock --format env)"'
+            )
 
     @staticmethod
     def name() -> str:
@@ -203,6 +263,20 @@ class QuintMiniSweAgent(MiniSweAgent):
         return "quint-mini-swe-agent"
 
     # ---- install ----------------------------------------------------------
+
+    @property
+    def _install_python_packages(self) -> list[str]:
+        """Add boto3 (→ botocore) for Bedrock models.
+
+        litellm's Bedrock path imports botocore to handle AWS credentials, but
+        mini-swe-agent's sandbox venv doesn't ship it (manifests as a
+        mislabelled `APIConnectionError: No module named 'botocore'` on the
+        first LLM call). Mirrors the parent's google-auth-for-vertex pattern.
+        """
+        packages = list(super()._install_python_packages)
+        if _is_bedrock_model(self.model_name):
+            packages.append("boto3")
+        return list(dict.fromkeys(packages))
 
     def install_spec(self) -> AgentInstallSpec:
         """Extend the parent's install steps with quint + skill materialization."""
