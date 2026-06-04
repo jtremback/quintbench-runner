@@ -40,6 +40,23 @@ from pier.models.agent.network import NetworkAllowlist
 # ---------------------------------------------------------------------------
 SKILL_DEST = "/opt/quint-skill"
 
+# ---------------------------------------------------------------------------
+# Quint + its rust evaluator.
+# quint is pinned so the evaluator version it expects matches the musl binary
+# we pre-place. The musl (statically-linked) evaluator avoids the default
+# rust binary's two showstoppers in the sandbox: it's normally downloaded from
+# GitHub on first run (air-gapped at task time) and is glibc-linked against a
+# newer glibc than the base images have. Static + pre-placed = fast rust
+# backend, offline, on any base image. QUINT_HOME points quint at it.
+# ---------------------------------------------------------------------------
+QUINT_VERSION = "0.32.0"
+EVALUATOR_VERSION = "v0.6.0"
+QUINT_HOME_DIR = "/opt/quint-home"
+EVALUATOR_URL = (
+    "https://github.com/jtremback/quintbench-runner/releases/download/"
+    "quint-evaluator-v0.6.0-musl/quint_evaluator_musl"
+)
+
 
 # ---------------------------------------------------------------------------
 # Locating the skill on the host.
@@ -85,26 +102,31 @@ def _resolve_skill_path(explicit: str | Path | None) -> Path:
 
 
 def _install_node_and_quint_script() -> str:
-    """Install Node + npm + quint globally via whichever package manager is
-    available. Mirrors the apt/apk/yum/dnf fan-out pattern from
-    MiniSweAgent.install_spec() for portability across base images."""
-    # On Debian/Ubuntu images with NodeSource preconfigured (the case for the
-    # DeepSWE base images we've seen), `apt-get install -y nodejs` pulls
-    # NodeSource's nodejs which bundles npm. Trying to install Debian's npm
-    # package separately on top conflicts ("nodejs : Conflicts: npm"), so
-    # don't. We verify npm exists after; if it doesn't, the image isn't using
-    # NodeSource and the run fails loudly — fix in a follow-up iteration.
-    return r"""
-set -euo pipefail
+    """Install Node + quint, then place a musl-static rust evaluator so
+    `quint run` works fast and offline on any base image.
 
+    Config (quint version, evaluator URL, QUINT_HOME) is injected as shell
+    variables in a header so the body can stay a plain raw string (it contains
+    shell and Quint braces that would clash with str.format/f-strings).
+    """
+    header = (
+        f"QUINT_VERSION={shlex.quote(QUINT_VERSION)}\n"
+        f"QUINT_HOME_DIR={shlex.quote(QUINT_HOME_DIR)}\n"
+        f"EVALUATOR_VERSION={shlex.quote(EVALUATOR_VERSION)}\n"
+        f"EVALUATOR_URL={shlex.quote(EVALUATOR_URL)}\n"
+    )
+    body = r"""
+# Install Node (+ curl). On Debian/Ubuntu images with NodeSource preconfigured
+# (the DeepSWE base images), `apt-get install -y nodejs` pulls NodeSource's
+# nodejs which bundles npm; installing Debian's npm on top conflicts, so don't.
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get update && apt-get install -y nodejs
+  apt-get update && apt-get install -y nodejs curl
 elif command -v apk >/dev/null 2>&1; then
-  apk add --no-cache nodejs npm
+  apk add --no-cache nodejs npm curl
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y nodejs npm
+  yum install -y nodejs npm curl
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y nodejs npm
+  dnf install -y nodejs npm curl
 else
   echo "ERROR: no known package manager (apt/apk/yum/dnf) to install Node" >&2
   exit 1
@@ -115,38 +137,34 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-npm install -g @informalsystems/quint
-
-# Sanity check; loud failure if quint isn't on PATH.
+# Pin quint so the evaluator version it expects matches the binary we place.
+npm install -g "@informalsystems/quint@${QUINT_VERSION}"
 quint --version
 
-# --- Force the TypeScript evaluator backend ---------------------------------
-# quint's default `rust` backend downloads a native binary that needs a recent
-# glibc and GitHub access at runtime — neither exists in the air-gapped sandbox
-# (it dies with GLIBC_2.39-not-found / EAI_AGAIN). The agent also reliably omits
-# `--backend=typescript` on its first `quint run`, wasting a turn. Shadow the
-# quint entrypoint with a wrapper that injects `--backend=typescript` for
-# `run`/`test` whenever the caller didn't already pass a --backend. Idempotent
-# with the skill examples (won't double the flag).
-QUINT_BIN="$(command -v quint)"
-if [ -z "$QUINT_BIN" ]; then
-  echo "ERROR: quint not on PATH after install; cannot install backend wrapper" >&2
-  exit 1
-fi
-QUINT_REAL="${QUINT_BIN}-real"
-mv "$QUINT_BIN" "$QUINT_REAL"
-cat > "$QUINT_BIN" <<WRAP
-#!/usr/bin/env bash
-real="\$(dirname "\$0")/$(basename "$QUINT_REAL")"
-if { [ "\$1" = "run" ] || [ "\$1" = "test" ]; } && ! printf '%s\n' "\$@" | grep -q -- '--backend'; then
-  exec "\$real" "\$@" --backend=typescript
-fi
-exec "\$real" "\$@"
-WRAP
-chmod +x "$QUINT_BIN"
-# Verify the wrapper resolves and the real binary still works.
-quint --version
-""".strip()
+# Place the musl-static rust evaluator where quint looks (QUINT_HOME). Static
+# => no glibc dependency; pre-placed => no runtime download; quint uses a
+# present binary with no checksum, so our self-built one is accepted.
+EVAL_DIR="${QUINT_HOME_DIR}/rust-evaluator-${EVALUATOR_VERSION}"
+mkdir -p "$EVAL_DIR"
+curl -fsSL "$EVALUATOR_URL" -o "$EVAL_DIR/quint_evaluator"
+chmod +x "$EVAL_DIR/quint_evaluator"
+chmod -R a+rX "$QUINT_HOME_DIR"
+
+# Verify the evaluator actually runs on THIS base image, via the default rust
+# backend, with no network — fail loud at build, not at task time.
+VSPEC="$(mktemp -d)/v.qnt"
+cat > "$VSPEC" <<'QNT'
+module v {
+  var x: int
+  action init = { x' = 0 }
+  action step = { x' = x + 1 }
+  val inv = x >= 0
+}
+QNT
+QUINT_HOME="$QUINT_HOME_DIR" quint run "$VSPEC" --invariant=inv --max-steps=3 --max-samples=3
+echo "quint rust evaluator verified at $QUINT_HOME_DIR"
+"""
+    return ("set -euo pipefail\n" + header + body).strip()
 
 
 def _materialize_skill_files_script(skill_root: Path) -> str:
@@ -239,6 +257,10 @@ class QuintMiniSweAgent(MiniSweAgent):
         # Resolve at construction time, not at module import. Pier may load
         # this module before the skill is available (e.g. CLI inspection).
         self._skill_root = _resolve_skill_path(skill_path)
+        # Point quint at the pre-placed musl evaluator at task time. _extra_env
+        # propagates into the agent's bash subprocesses. setdefault so an
+        # explicit --agent-env QUINT_HOME wins.
+        self._extra_env.setdefault("QUINT_HOME", QUINT_HOME_DIR)
         if _is_bedrock_model(self.model_name):
             self._forward_bedrock_credentials()
 
