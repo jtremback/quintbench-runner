@@ -119,6 +119,33 @@ npm install -g @informalsystems/quint
 
 # Sanity check; loud failure if quint isn't on PATH.
 quint --version
+
+# --- Force the TypeScript evaluator backend ---------------------------------
+# quint's default `rust` backend downloads a native binary that needs a recent
+# glibc and GitHub access at runtime — neither exists in the air-gapped sandbox
+# (it dies with GLIBC_2.39-not-found / EAI_AGAIN). The agent also reliably omits
+# `--backend=typescript` on its first `quint run`, wasting a turn. Shadow the
+# quint entrypoint with a wrapper that injects `--backend=typescript` for
+# `run`/`test` whenever the caller didn't already pass a --backend. Idempotent
+# with the skill examples (won't double the flag).
+QUINT_BIN="$(command -v quint)"
+if [ -z "$QUINT_BIN" ]; then
+  echo "ERROR: quint not on PATH after install; cannot install backend wrapper" >&2
+  exit 1
+fi
+QUINT_REAL="${QUINT_BIN}-real"
+mv "$QUINT_BIN" "$QUINT_REAL"
+cat > "$QUINT_BIN" <<WRAP
+#!/usr/bin/env bash
+real="\$(dirname "\$0")/$(basename "$QUINT_REAL")"
+if { [ "\$1" = "run" ] || [ "\$1" = "test" ]; } && ! printf '%s\n' "\$@" | grep -q -- '--backend'; then
+  exec "\$real" "\$@" --backend=typescript
+fi
+exec "\$real" "\$@"
+WRAP
+chmod +x "$QUINT_BIN"
+# Verify the wrapper resolves and the real binary still works.
+quint --version
 """.strip()
 
 
