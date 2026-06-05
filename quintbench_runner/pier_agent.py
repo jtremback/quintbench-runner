@@ -194,39 +194,56 @@ echo "quint rust evaluator verified at $QUINT_HOME_DIR"
     return ("set -euo pipefail\n" + header + body).strip()
 
 
-def _materialize_skill_files_script(skill_root: Path) -> str:
-    """Generate a shell script that materializes the skill at ``SKILL_DEST``.
+def _materialize_skill_files_steps(skill_root: Path) -> list[str]:
+    """Scripts that materialize the skill at ``SKILL_DEST``, as a *list* of
+    install-step bodies.
 
     Pier inlines each install step as a single ``RUN ["/bin/bash","-c","..."]``
-    line in the Dockerfile, and BuildKit caps Dockerfile lines at 64 KB. A
-    naive heredoc-per-file approach hit that ceiling (the skill is ~140 KB
-    raw). Instead we tar+gzip the skill on the host, base64-encode the blob,
-    and have the sandbox decode-and-extract it in one shot. ~140 KB raw
-    compresses to ~30 KB gzipped and ~40 KB base64 — well under 64 KB.
+    line, and BuildKit caps Dockerfile lines at 64 KB. We tar+gzip the whole
+    skill (SKILL.md + the guidelines/ tree, including the vendored choreo/
+    framework), base64 the blob, and append it to a file in fixed-size chunks
+    across multiple steps — each step's line stays well under 64 KB regardless
+    of how large the skill grows. A final step decodes and extracts.
     """
-    # Build a tar.gz of the skill in memory. Members are stored with paths
-    # relative to SKILL_DEST so we can extract straight into it.
+    def _skip_dotfiles(ti: tarfile.TarInfo):
+        base = ti.name.rsplit("/", 1)[-1]
+        return None if base.startswith(".") else ti
+
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        skill_md = skill_root / "SKILL.md"
-        tar.add(skill_md, arcname="SKILL.md")
-        guidelines_dir = skill_root / "guidelines"
-        for md in sorted(guidelines_dir.glob("*.md")):
-            tar.add(md, arcname=f"guidelines/{md.name}")
-        examples_dir = guidelines_dir / "examples"
-        if examples_dir.is_dir():
-            for qnt in sorted(examples_dir.glob("*.qnt")):
-                tar.add(qnt, arcname=f"guidelines/examples/{qnt.name}")
+        tar.add(skill_root / "SKILL.md", arcname="SKILL.md")
+        tar.add(
+            skill_root / "guidelines",
+            arcname="guidelines",
+            filter=_skip_dotfiles,
+        )
 
     blob_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     dest_q = shlex.quote(SKILL_DEST)
-    return (
+    b64_path = "/tmp/quint-skill.b64"
+
+    # base64 is [A-Za-z0-9+/=] only, so single-quoting each chunk is safe.
+    chunk_size = 48_000
+    chunks = [
+        blob_b64[i : i + chunk_size] for i in range(0, len(blob_b64), chunk_size)
+    ]
+
+    steps: list[str] = []
+    for idx, chunk in enumerate(chunks):
+        redir = ">" if idx == 0 else ">>"
+        steps.append(
+            "set -euo pipefail\n"
+            f"printf '%s' '{chunk}' {redir} {b64_path}\n"
+        )
+    steps.append(
         "set -euo pipefail\n"
         f"mkdir -p {dest_q}\n"
-        f'echo "{blob_b64}" | base64 -d | tar -xzf - -C {dest_q}\n'
+        f"base64 -d {b64_path} | tar -xzf - -C {dest_q}\n"
+        f"rm -f {b64_path}\n"
         f"test -f {dest_q}/SKILL.md && test -d {dest_q}/guidelines "
         "|| (echo 'ERROR: skill materialization failed' >&2; exit 1)\n"
     )
+    return steps
 
 
 # Extra domains needed during the install phase, beyond the LLM-provider ones
@@ -378,10 +395,9 @@ class QuintMiniSweAgent(MiniSweAgent):
                     env={"DEBIAN_FRONTEND": "noninteractive"},
                     run=_install_node_and_quint_script(),
                 ),
-                InstallStep(
-                    user="root",
-                    env=None,
-                    run=_materialize_skill_files_script(self._skill_root),
+                *(
+                    InstallStep(user="root", env=None, run=s)
+                    for s in _materialize_skill_files_steps(self._skill_root)
                 ),
             ],
             verification_command=base.verification_command,
