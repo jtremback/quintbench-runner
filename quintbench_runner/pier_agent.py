@@ -190,6 +190,14 @@ module v {
 QNT
 QUINT_HOME="$QUINT_HOME_DIR" quint run "$VSPEC" --invariant=inv --max-steps=3 --max-samples=3
 echo "quint rust evaluator verified at $QUINT_HOME_DIR"
+
+# Persist Quint specs natively. The skill writes specs to /tmp/quint-specs
+# (harness-agnostic). Symlink that to the bind-mounted /logs/agent so the
+# specs land in the host trial dir (jobs/.../agent/quint-specs/) instead of
+# being lost with /tmp. They stay outside /app, so they're still never part
+# of the submitted diff. The mount/target appears at task time; ln only needs
+# to create the link now.
+ln -sfn /logs/agent/quint-specs /tmp/quint-specs
 """
     return ("set -euo pipefail\n" + header + body).strip()
 
