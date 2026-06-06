@@ -24,3 +24,6 @@ venv/
 # Pier job artifacts and smoke logs from local runs
 jobs/
 *.log
+
+# Derived review tree from scripts/extract-review.py
+review/
