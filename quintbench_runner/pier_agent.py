@@ -57,18 +57,18 @@ EVALUATOR_URL = (
     "quint-evaluator-v0.6.0-musl/quint_evaluator_musl"
 )
 
-# Prepended to the instruction when force_quint=True. This is the "forced" arm:
-# it removes the agent's triage choice so every trial actually exercises Quint
-# (eliminating the invocation-noise and self-selection confound that make the
-# voluntary-use arm unmeasurable). Intended for the temporal-amenable task
-# subset only — forcing a spec on a task with no real state/ordering property
-# just wastes the budget.
+# Prepended to the instruction when force_quint is on (the default). The
+# "forced" arm removes the agent's triage choice so every trial actually
+# exercises Quint, eliminating the invocation-noise and self-selection
+# confound that made the voluntary-use arm unmeasurable. Point it at
+# temporal-amenable tasks — forcing a spec on a task with no real
+# state/ordering property mostly wastes the budget.
 _FORCE_QUINT_PREAMBLE = """\
 # REQUIRED: model this task in Quint before writing code
 
-This task has been pre-selected as one where formal modeling is expected to
-help. For this task the "decide whether to model" guidance below does **not**
-apply — modeling is mandatory. Before writing any implementation code you MUST:
+Before writing any implementation code you MUST model this task in Quint. The
+"decide whether to model" guidance in the skill below does **not** apply here —
+modeling is mandatory, not optional:
 
 1. Write a Quint spec capturing the core state / ordering / concurrency
    property of the behavior you are implementing (the subtle slice — not the
@@ -303,14 +303,16 @@ class QuintMiniSweAgent(MiniSweAgent):
         self,
         *args,
         skill_path: str | Path | None = None,
-        force_quint: bool | str = False,
+        force_quint: bool | str = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         # Resolve at construction time, not at module import. Pier may load
         # this module before the skill is available (e.g. CLI inspection).
         self._skill_root = _resolve_skill_path(skill_path)
-        # `force_quint` arrives as a string via --agent-kwarg; coerce.
+        # Quint use is forced by default (the agent reliably under-invokes it
+        # otherwise). Pass --agent-kwarg force_quint=false for a voluntary-use
+        # or control arm. Arrives as a string via --agent-kwarg; coerce.
         self._force_quint = str(force_quint).strip().lower() in (
             "1", "true", "yes", "on",
         )
