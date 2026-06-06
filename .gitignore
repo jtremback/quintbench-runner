@@ -27,3 +27,6 @@ jobs/
 
 # Derived review tree from scripts/extract-review.py
 review/
+
+# Derived reconstituted repos from scripts/reconstitute.py
+recon/
